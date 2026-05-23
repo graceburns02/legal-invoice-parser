@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import io
-from collections import defaultdict
 
 import pandas as pd
 import pdfplumber
+import pytesseract
 import streamlit as st
+from pdf2image import convert_from_bytes
 
 
 st.set_page_config(page_title="Invoice Parser", layout="centered")
 
 st.title("Legal Invoice Parser")
 st.write("Upload an invoice PDF, preview line items, and download them as CSV.")
+
+
+STOP_MARKERS = ("subtotal", "tax", "total due", "payment terms", "notes")
 
 
 def _parse_row_from_right(row_text: str) -> dict[str, str] | None:
@@ -35,68 +39,67 @@ def _parse_row_from_right(row_text: str) -> dict[str, str] | None:
     }
 
 
-def local_parse_invoice(pdf_bytes: bytes) -> tuple[pd.DataFrame, list[dict[str, object]]]:
-    stop_markers = ("subtotal", "tax", "total due", "payment terms")
-    page_debug: list[dict[str, object]] = []
+def _find_and_parse_line_items(lines: list[str]) -> list[dict[str, str]]:
+    header_index: int | None = None
+    for i, row in enumerate(lines):
+        row_lower = row.lower()
+        if (
+            "description" in row_lower
+            and "price" in row_lower
+            and "qty" in row_lower
+            and "total" in row_lower
+        ):
+            header_index = i
+            break
+
+    if header_index is None:
+        return []
+
     line_items: list[dict[str, str]] = []
+    for row in lines[header_index + 1 :]:
+        row_lower = row.lower()
+        if any(marker in row_lower for marker in STOP_MARKERS):
+            break
+
+        parsed = _parse_row_from_right(row)
+        if parsed:
+            line_items.append(parsed)
+
+    return line_items
+
+
+def local_parse_invoice(pdf_bytes: bytes) -> tuple[pd.DataFrame, dict[str, object]]:
+    extracted_lines: list[str] = []
+    extraction_method = "embedded"
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page_number, page in enumerate(pdf.pages, start=1):
+        for page in pdf.pages:
             page_text = page.extract_text() or ""
+            if page_text.strip():
+                extracted_lines.extend([line.strip() for line in page_text.split("\n") if line.strip()])
+
             page_words = page.extract_words(x_tolerance=2, y_tolerance=3) or []
-
-            page_debug.append(
-                {
-                    "page_number": page_number,
-                    "text": page_text,
-                    "words_preview": page_words[:50],
-                    "no_embedded_text": not page_text.strip() and not page_words,
-                }
-            )
-
-            page_rows: list[str] = []
             if page_words:
-                rows_by_top: dict[float, list[dict]] = defaultdict(list)
-                for word in page_words:
-                    top_key = round(float(word["top"]), 1)
-                    rows_by_top[top_key].append(word)
+                extracted_lines.extend([word["text"].strip() for word in page_words if word.get("text", "").strip()])
 
-                for _, row_words in sorted(rows_by_top.items(), key=lambda item: item[0]):
-                    sorted_words = sorted(row_words, key=lambda w: float(w["x0"]))
-                    row_text = " ".join(
-                        w["text"].strip() for w in sorted_words if w.get("text", "").strip()
-                    )
-                    if row_text:
-                        page_rows.append(row_text)
+    has_embedded_text = any(line.strip() for line in extracted_lines)
 
-            if not page_rows and page_text.strip():
-                page_rows = [line.strip() for line in page_text.split("\n") if line.strip()]
+    if not has_embedded_text:
+        extraction_method = "ocr"
+        extracted_lines = []
+        images = convert_from_bytes(pdf_bytes)
+        for image in images:
+            ocr_text = pytesseract.image_to_string(image) or ""
+            extracted_lines.extend([line.strip() for line in ocr_text.split("\n") if line.strip()])
 
-            header_index: int | None = None
-            for i, row in enumerate(page_rows):
-                row_lower = row.lower()
-                if (
-                    "description" in row_lower
-                    and "price" in row_lower
-                    and "qty" in row_lower
-                    and "total" in row_lower
-                ):
-                    header_index = i
-                    break
+    line_items = _find_and_parse_line_items(extracted_lines)
+    df = pd.DataFrame(line_items, columns=["Description", "Price", "QTY", "Total"])
 
-            if header_index is None:
-                continue
-
-            for row in page_rows[header_index + 1 :]:
-                row_lower = row.lower()
-                if any(marker in row_lower for marker in stop_markers):
-                    break
-
-                parsed = _parse_row_from_right(row)
-                if parsed:
-                    line_items.append(parsed)
-
-    return pd.DataFrame(line_items, columns=["Description", "Price", "QTY", "Total"]), page_debug
+    debug_info = {
+        "method": extraction_method,
+        "raw_text": "\n".join(extracted_lines),
+    }
+    return df, debug_info
 
 
 show_debug = st.checkbox("Show extracted text debug")
@@ -104,33 +107,14 @@ uploaded_file = st.file_uploader("Upload invoice PDF", type=["pdf"])
 
 if uploaded_file is not None:
     file_bytes = uploaded_file.read()
-    df_line_items, debug_pages = local_parse_invoice(file_bytes)
+    df_line_items, debug_info = local_parse_invoice(file_bytes)
     line_items_csv = df_line_items.to_csv(index=False).encode("utf-8")
 
     if show_debug:
         st.subheader("Extraction Debug")
-        for page_info in debug_pages:
-            st.markdown(f"**Page {page_info['page_number']}**")
-
-            if page_info["no_embedded_text"]:
-                st.warning(
-                    "No embedded PDF text found. This PDF may be scanned/image-based and needs OCR."
-                )
-
-            st.caption("page.extract_text()")
-            st.code(page_info["text"] or "", language="text")
-
-            st.caption("First 50 results from page.extract_words()")
-            st.json(page_info["words_preview"])
-
-            raw_lines: list[str] = []
-            text_value = str(page_info["text"] or "")
-            if text_value.strip():
-                raw_lines = [line for line in text_value.split("\n") if line.strip()]
-
-            if raw_lines:
-                st.caption("Raw extracted lines before filtering")
-                st.code("\n".join(raw_lines), language="text")
+        st.write(f"Method used: **{debug_info['method'].upper()}**")
+        st.caption("Raw extracted text")
+        st.code(str(debug_info["raw_text"]), language="text")
 
     st.subheader("Preview")
     st.caption("Invoice Line Items")
