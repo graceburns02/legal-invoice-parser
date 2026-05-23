@@ -28,6 +28,7 @@ The app:
 - pandas
 
 ## Run Locally
+streamlit run app.py
 
 Install dependencies:
 
