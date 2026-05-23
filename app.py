@@ -15,57 +15,58 @@ st.title("Legal Invoice Parser")
 st.write("Upload an invoice PDF, preview line items, and download them as CSV.")
 
 
-STOP_MARKERS = ("subtotal", "tax", "total due", "payment terms", "notes")
+import re
 
 
-def _parse_row_from_right(row_text: str) -> dict[str, str] | None:
-    parts = row_text.split()
-    if len(parts) < 4:
-        return None
+def parse_column_ocr_text(raw_text: str) -> pd.DataFrame:
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
 
-    description = " ".join(parts[:-3]).strip()
-    price = parts[-3].strip()
-    qty = parts[-2].strip()
-    total = parts[-1].strip()
+    descriptions: list[str] = []
+    prices: list[str] = []
+    qtys: list[str] = []
+    totals: list[str] = []
 
-    if not description:
-        return None
+    try:
+        desc_start = lines.index("Description") + 1
+        for line in lines[desc_start:]:
+            lower = line.lower()
+            if lower.startswith("payment terms") or lower.startswith("notes"):
+                break
+            if lower.startswith("service"):
+                descriptions.append(line)
+    except ValueError:
+        pass
 
-    return {
-        "Description": description,
-        "Price": price,
-        "QTY": qty,
-        "Total": total,
-    }
+    price_qty_pattern = re.compile(r"^(\d+\.\d{2})\s+(\d+)$")
+    for line in lines:
+        match = price_qty_pattern.match(line)
+        if match:
+            prices.append(match.group(1))
+            qtys.append(match.group(2))
 
+    money_pattern = re.compile(r"^\d+\.\d{2}$")
+    total_indices = [i for i, line in enumerate(lines) if line.lower() == "total"]
 
-def _find_and_parse_line_items(lines: list[str]) -> list[dict[str, str]]:
-    header_index: int | None = None
-    for i, row in enumerate(lines):
-        row_lower = row.lower()
-        if (
-            "description" in row_lower
-            and "price" in row_lower
-            and "qty" in row_lower
-            and "total" in row_lower
-        ):
-            header_index = i
-            break
+    if total_indices:
+        total_start = total_indices[-1] + 1
+        for line in lines[total_start:]:
+            if money_pattern.match(line):
+                totals.append(line)
 
-    if header_index is None:
-        return []
+    row_count = min(len(descriptions), len(prices), len(qtys), len(totals))
 
-    line_items: list[dict[str, str]] = []
-    for row in lines[header_index + 1 :]:
-        row_lower = row.lower()
-        if any(marker in row_lower for marker in STOP_MARKERS):
-            break
+    rows = []
+    for i in range(row_count):
+        rows.append(
+            {
+                "Description": descriptions[i],
+                "Price": prices[i],
+                "QTY": qtys[i],
+                "Total": totals[i],
+            }
+        )
 
-        parsed = _parse_row_from_right(row)
-        if parsed:
-            line_items.append(parsed)
-
-    return line_items
+    return pd.DataFrame(rows, columns=["Description", "Price", "QTY", "Total"])
 
 
 def local_parse_invoice(pdf_bytes: bytes) -> tuple[pd.DataFrame, dict[str, object]]:
@@ -92,12 +93,21 @@ def local_parse_invoice(pdf_bytes: bytes) -> tuple[pd.DataFrame, dict[str, objec
             ocr_text = pytesseract.image_to_string(image) or ""
             extracted_lines.extend([line.strip() for line in ocr_text.split("\n") if line.strip()])
 
-    line_items = _find_and_parse_line_items(extracted_lines)
-    df = pd.DataFrame(line_items, columns=["Description", "Price", "QTY", "Total"])
+    raw_text = "\n".join(extracted_lines)
+    if extraction_method == "ocr":
+        df = parse_column_ocr_text(raw_text)
+    else:
+        df = parse_column_ocr_text(raw_text)
+
+    debug_rows = [
+        f"{row.Description} | {row.Price} | {row.QTY} | {row.Total}"
+        for row in df.itertuples(index=False)
+    ]
 
     debug_info = {
         "method": extraction_method,
-        "raw_text": "\n".join(extracted_lines),
+        "raw_text": raw_text,
+        "parsed_rows": "\n".join(debug_rows),
     }
     return df, debug_info
 
@@ -115,6 +125,8 @@ if uploaded_file is not None:
         st.write(f"Method used: **{debug_info['method'].upper()}**")
         st.caption("Raw extracted text")
         st.code(str(debug_info["raw_text"]), language="text")
+        st.caption("Parsed rows")
+        st.code(str(debug_info["parsed_rows"]), language="text")
 
     st.subheader("Preview")
     st.caption("Invoice Line Items")
