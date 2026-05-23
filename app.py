@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import re
+from collections import defaultdict
 
 import pandas as pd
 import pdfplumber
@@ -14,63 +16,50 @@ st.write("Upload an invoice PDF, preview line items, and download them as CSV.")
 
 
 def local_parse_invoice(pdf_bytes: bytes) -> pd.DataFrame:
-    all_rows = []
-
-    table_settings = {
-        "vertical_strategy": "text",
-        "horizontal_strategy": "text",
-        "snap_y_tolerance": 3,
-        "intersection_y_tolerance": 3,
-    }
+    extracted_rows: list[str] = []
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
-            tables = page.extract_tables(table_settings=table_settings)
+            words = page.extract_words(x_tolerance=2, y_tolerance=3) or []
 
-            for table in tables:
-                for row in table:
-                    cleaned = [cell.strip() if cell else "" for cell in row]
-                    if any(cleaned):
-                        all_rows.append(cleaned)
+            rows_by_top: dict[float, list[dict]] = defaultdict(list)
+            for word in words:
+                top_key = round(float(word["top"]), 1)
+                rows_by_top[top_key].append(word)
 
-    if not all_rows:
-        return pd.DataFrame(columns=["Description", "Price", "QTY", "Total"])
+            for _, row_words in sorted(rows_by_top.items(), key=lambda item: item[0]):
+                sorted_words = sorted(row_words, key=lambda w: float(w["x0"]))
+                row_text = " ".join(w["text"].strip() for w in sorted_words if w.get("text", "").strip())
+                if row_text:
+                    extracted_rows.append(row_text)
 
-    max_cols = max(len(row) for row in all_rows)
-    normalized_rows = [row + [""] * (max_cols - len(row)) for row in all_rows]
-    df = pd.DataFrame(normalized_rows)
-
-    header_idx = None
-    for idx, row in df.iterrows():
-        row_text = " ".join(str(value).lower() for value in row)
-        if "description" in row_text and "price" in row_text:
-            header_idx = idx
-            break
-
-    if header_idx is not None:
-        df.columns = df.iloc[header_idx]
-        df = df.iloc[header_idx + 1 :].reset_index(drop=True)
-    else:
-        fallback_columns = ["Description", "Price", "QTY", "Total"]
-        df.columns = fallback_columns + [
-            f"Column {i}" for i in range(5, max_cols + 1)
-        ]
-
-    df = df.dropna(how="all")
-    df = df.loc[:, df.columns.astype(str).str.strip() != ""]
-
-    description_col = next(
-        (col for col in df.columns if str(col).strip().lower() == "description"),
-        df.columns[0],
+    line_item_pattern = re.compile(
+        r"^(?P<description>.+?)\s+(?P<price>\$?\d[\d,]*(?:\.\d{1,2})?)\s+(?P<qty>\d+(?:\.\d+)?)\s+(?P<total>\$?\d[\d,]*(?:\.\d{1,2})?)$"
     )
 
-    df[description_col] = df[description_col].astype(str).str.strip()
+    ignore_pattern = re.compile(
+        r"(?i)\b(subtotal|tax|total due|balance due|payment terms|invoice number|invoice #|bill to|ship to|amount due|invoice date|due date|terms|remit|attn|account)\b"
+    )
 
-    exclude_pattern = r"(?i)subtotal|tax|total due|payment terms|balance due"
-    df = df[~df[description_col].str.contains(exclude_pattern, na=False)]
-    df = df[df[description_col] != ""]
+    line_items: list[dict[str, str]] = []
+    for row_text in extracted_rows:
+        if ignore_pattern.search(row_text):
+            continue
 
-    return df.reset_index(drop=True)
+        match = line_item_pattern.match(row_text.strip())
+        if not match:
+            continue
+
+        line_items.append(
+            {
+                "Description": match.group("description").strip(),
+                "Price": match.group("price").strip(),
+                "QTY": match.group("qty").strip(),
+                "Total": match.group("total").strip(),
+            }
+        )
+
+    return pd.DataFrame(line_items, columns=["Description", "Price", "QTY", "Total"])
 
 
 uploaded_file = st.file_uploader("Upload invoice PDF", type=["pdf"])
@@ -81,6 +70,10 @@ if uploaded_file is not None:
 
     st.subheader("Preview")
     st.caption("Invoice Line Items")
+
+    if df_line_items.empty:
+        st.warning("No line items were detected in this invoice.")
+
     st.dataframe(df_line_items, use_container_width=True)
 
     st.download_button(
