@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import io
-import re
 from collections import defaultdict
 
 import pandas as pd
@@ -15,58 +14,123 @@ st.title("Legal Invoice Parser")
 st.write("Upload an invoice PDF, preview line items, and download them as CSV.")
 
 
-def local_parse_invoice(pdf_bytes: bytes) -> pd.DataFrame:
-    extracted_rows: list[str] = []
+def _parse_row_from_right(row_text: str) -> dict[str, str] | None:
+    parts = row_text.split()
+    if len(parts) < 4:
+        return None
+
+    description = " ".join(parts[:-3]).strip()
+    price = parts[-3].strip()
+    qty = parts[-2].strip()
+    total = parts[-1].strip()
+
+    if not description:
+        return None
+
+    return {
+        "Description": description,
+        "Price": price,
+        "QTY": qty,
+        "Total": total,
+    }
+
+
+def local_parse_invoice(pdf_bytes: bytes) -> tuple[pd.DataFrame, list[dict[str, object]]]:
+    stop_markers = ("subtotal", "tax", "total due", "payment terms")
+    page_debug: list[dict[str, object]] = []
+    line_items: list[dict[str, str]] = []
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            words = page.extract_words(x_tolerance=2, y_tolerance=3) or []
+        for page_number, page in enumerate(pdf.pages, start=1):
+            page_text = page.extract_text() or ""
+            page_words = page.extract_words(x_tolerance=2, y_tolerance=3) or []
 
-            rows_by_top: dict[float, list[dict]] = defaultdict(list)
-            for word in words:
-                top_key = round(float(word["top"]), 1)
-                rows_by_top[top_key].append(word)
+            page_debug.append(
+                {
+                    "page_number": page_number,
+                    "text": page_text,
+                    "words_preview": page_words[:50],
+                    "no_embedded_text": not page_text.strip() and not page_words,
+                }
+            )
 
-            for _, row_words in sorted(rows_by_top.items(), key=lambda item: item[0]):
-                sorted_words = sorted(row_words, key=lambda w: float(w["x0"]))
-                row_text = " ".join(w["text"].strip() for w in sorted_words if w.get("text", "").strip())
-                if row_text:
-                    extracted_rows.append(row_text)
+            page_rows: list[str] = []
+            if page_words:
+                rows_by_top: dict[float, list[dict]] = defaultdict(list)
+                for word in page_words:
+                    top_key = round(float(word["top"]), 1)
+                    rows_by_top[top_key].append(word)
 
-    line_item_pattern = re.compile(
-        r"^(?P<description>.+?)\s+(?P<price>\$?\d[\d,]*(?:\.\d{1,2})?)\s+(?P<qty>\d+(?:\.\d+)?)\s+(?P<total>\$?\d[\d,]*(?:\.\d{1,2})?)$"
-    )
+                for _, row_words in sorted(rows_by_top.items(), key=lambda item: item[0]):
+                    sorted_words = sorted(row_words, key=lambda w: float(w["x0"]))
+                    row_text = " ".join(
+                        w["text"].strip() for w in sorted_words if w.get("text", "").strip()
+                    )
+                    if row_text:
+                        page_rows.append(row_text)
 
-    ignore_pattern = re.compile(
-        r"(?i)\b(subtotal|tax|total due|balance due|payment terms|invoice number|invoice #|bill to|ship to|amount due|invoice date|due date|terms|remit|attn|account)\b"
-    )
+            if not page_rows and page_text.strip():
+                page_rows = [line.strip() for line in page_text.split("\n") if line.strip()]
 
-    line_items: list[dict[str, str]] = []
-    for row_text in extracted_rows:
-        if ignore_pattern.search(row_text):
-            continue
+            header_index: int | None = None
+            for i, row in enumerate(page_rows):
+                row_lower = row.lower()
+                if (
+                    "description" in row_lower
+                    and "price" in row_lower
+                    and "qty" in row_lower
+                    and "total" in row_lower
+                ):
+                    header_index = i
+                    break
 
-        match = line_item_pattern.match(row_text.strip())
-        if not match:
-            continue
+            if header_index is None:
+                continue
 
-        line_items.append(
-            {
-                "Description": match.group("description").strip(),
-                "Price": match.group("price").strip(),
-                "QTY": match.group("qty").strip(),
-                "Total": match.group("total").strip(),
-            }
-        )
+            for row in page_rows[header_index + 1 :]:
+                row_lower = row.lower()
+                if any(marker in row_lower for marker in stop_markers):
+                    break
 
-    return pd.DataFrame(line_items, columns=["Description", "Price", "QTY", "Total"])
+                parsed = _parse_row_from_right(row)
+                if parsed:
+                    line_items.append(parsed)
+
+    return pd.DataFrame(line_items, columns=["Description", "Price", "QTY", "Total"]), page_debug
 
 
+show_debug = st.checkbox("Show extracted text debug")
 uploaded_file = st.file_uploader("Upload invoice PDF", type=["pdf"])
 
 if uploaded_file is not None:
-    df_line_items = local_parse_invoice(uploaded_file.read())
+    file_bytes = uploaded_file.read()
+    df_line_items, debug_pages = local_parse_invoice(file_bytes)
     line_items_csv = df_line_items.to_csv(index=False).encode("utf-8")
+
+    if show_debug:
+        st.subheader("Extraction Debug")
+        for page_info in debug_pages:
+            st.markdown(f"**Page {page_info['page_number']}**")
+
+            if page_info["no_embedded_text"]:
+                st.warning(
+                    "No embedded PDF text found. This PDF may be scanned/image-based and needs OCR."
+                )
+
+            st.caption("page.extract_text()")
+            st.code(page_info["text"] or "", language="text")
+
+            st.caption("First 50 results from page.extract_words()")
+            st.json(page_info["words_preview"])
+
+            raw_lines: list[str] = []
+            text_value = str(page_info["text"] or "")
+            if text_value.strip():
+                raw_lines = [line for line in text_value.split("\n") if line.strip()]
+
+            if raw_lines:
+                st.caption("Raw extracted lines before filtering")
+                st.code("\n".join(raw_lines), language="text")
 
     st.subheader("Preview")
     st.caption("Invoice Line Items")
