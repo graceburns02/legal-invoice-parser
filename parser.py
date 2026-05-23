@@ -23,11 +23,13 @@ except Exception:  # pragma: no cover - dependency can be unavailable in some en
     PdfReader = None
 
 
-LINE_ITEM_COLUMNS = ["Item", "Description", "Unit Cost", "Quantity", "Line Total"]
+LINE_ITEM_COLUMNS = ["Description", "Price", "QTY", "Total"]
 STOP_KEYWORDS = ("Invoice Terms:", "Subtotal", "Total")
-HEADER_TOKENS = tuple(col.lower() for col in LINE_ITEM_COLUMNS)
+HEADER_TOKENS = ("description", "price", "qty", "total")
 MONEY_PATTERN = re.compile(r"^\$?\d[\d,]*(?:\.\d{2})?$")
 QUANTITY_PATTERN = re.compile(r"^\d+(?:\.\d+)?$")
+PRICE_QTY_PATTERN = re.compile(r"^(\d+\.\d{2})\s+(\d+)$")
+MONEY_VALUE_PATTERN = re.compile(r"^\d+\.\d{2}$")
 METADATA_PREFIXES = (
     "invoice",
     "bill to",
@@ -89,7 +91,7 @@ def _parse_line_like_row(line: str) -> Optional[List[str]]:
     if not (_is_line_total(line_total) and _is_quantity(quantity) and _is_line_total(unit_cost)):
         return None
 
-    return [item, description, unit_cost, quantity, line_total]
+    return [description, unit_cost, quantity, line_total]
 
 
 def _extract_lines_from_ocr_layout(pdf_bytes: bytes) -> List[str]:
@@ -177,13 +179,85 @@ def _collect_rows(lines: Sequence[str]) -> List[List[str]]:
     return rows
 
 
+def _find_index(lines: Sequence[str], pattern: str, start: int = 0) -> int:
+    regex = re.compile(pattern, flags=re.IGNORECASE)
+    for idx in range(start, len(lines)):
+        if regex.search(lines[idx]):
+            return idx
+    return -1
+
+
+def _collect_columnar_rows(lines: Sequence[str]) -> List[List[str]]:
+    cleaned = [_normalize_space(line) for line in lines if _normalize_space(line)]
+    if not cleaned:
+        return []
+
+    description_idx = _find_index(cleaned, r"^description$")
+    if description_idx < 0:
+        return []
+
+    description_stop_idx = _find_index(cleaned, r"^(payment terms:?|notes:?)", start=description_idx + 1)
+    if description_stop_idx < 0:
+        description_stop_idx = len(cleaned)
+
+    descriptions = [
+        line
+        for line in cleaned[description_idx + 1 : description_stop_idx]
+        if not _is_probable_metadata(line)
+    ]
+
+    price_qty_idx = _find_index(cleaned, r"^price\s+qty$", start=description_idx + 1)
+    if price_qty_idx < 0:
+        return []
+
+    prices: List[str] = []
+    quantities: List[str] = []
+    idx = price_qty_idx + 1
+    while idx < len(cleaned):
+        matched = PRICE_QTY_PATTERN.match(cleaned[idx])
+        if not matched:
+            break
+        prices.append(matched.group(1))
+        quantities.append(matched.group(2))
+        idx += 1
+
+    total_due_idx = _find_index(cleaned, r"^total due$", start=price_qty_idx + 1)
+    if total_due_idx < 0:
+        return []
+
+    total_header_idx = _find_index(cleaned, r"^total$", start=total_due_idx + 1)
+    if total_header_idx < 0:
+        return []
+
+    totals: List[str] = []
+    idx = total_header_idx + 1
+    while idx < len(cleaned):
+        if not MONEY_VALUE_PATTERN.match(cleaned[idx]):
+            break
+        totals.append(cleaned[idx])
+        idx += 1
+
+    row_count = min(len(descriptions), len(prices), len(quantities), len(totals))
+    if row_count == 0:
+        return []
+
+    rows: List[List[str]] = []
+    for i in range(row_count):
+        rows.append([descriptions[i], prices[i], quantities[i], totals[i]])
+    return rows
+
+
 def parse_line_items(pdf_bytes: bytes) -> pd.DataFrame:
     ocr_lines = _extract_lines_from_ocr_layout(pdf_bytes)
     rows = _collect_rows(ocr_lines)
+    if not rows:
+        rows = _collect_columnar_rows(ocr_lines)
 
     if not rows:
         fallback_lines = _extract_lines_with_pypdf(pdf_bytes)
         rows = _collect_rows(fallback_lines)
+        if not rows:
+            rows = _collect_columnar_rows(fallback_lines)
 
     return pd.DataFrame(rows, columns=LINE_ITEM_COLUMNS)
 
