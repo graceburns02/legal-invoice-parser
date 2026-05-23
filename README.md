@@ -1,6 +1,6 @@
 # OCR Invoice Parser
 
-Live Demo: https://YOUR-APP.streamlit.app
+Live Demo: https://legal-invoice-parser.streamlit.app/
 
 A local-first invoice parsing tool that extracts structured line-item data from scanned and borderless PDF invoices using OCR and exports clean CSV files.
 
@@ -13,12 +13,6 @@ A local-first invoice parsing tool that extracts structured line-item data from 
 - CSV export
 - Streamlit UI
 - Local processing (no external APIs)
-
----
-
-## Demo
-
-![App Preview](screenshots/app_preview.png)
 
 ---
 
